@@ -42,6 +42,7 @@ class WandbLogWriter(SummaryWriter, LogWriter):
             entity=entity,
             name=run_name,
             config={"log_dir": log_dir},
+            settings=wandb.Settings(),
         )
 
         # Initialize set to keep track of logged videos

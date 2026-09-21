@@ -84,6 +84,7 @@ class OnPolicyRunner:
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
+            self._on_learning_iteration_start(it)
             start = time.time()
             # Rollout
             with torch.inference_mode():
@@ -138,6 +139,9 @@ class OnPolicyRunner:
         # Save the final model after training
         if self.model_dir is not None and not self.logger.disable_logs:
             self.save(os.path.join(self.model_dir, f"model_{self.current_learning_iteration:0{len(str(total_it))}}.pt"))
+
+    def _on_learning_iteration_start(self, iteration: int) -> None:
+        """Apply subclass curricula before collecting this update's rollout."""
 
     def save(self, path: str, infos: dict | None = None) -> None:
         """Save the models and training state to a given path and upload them if external logging is used."""
