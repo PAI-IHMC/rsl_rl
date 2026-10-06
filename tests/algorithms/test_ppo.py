@@ -318,3 +318,55 @@ class TestAdaptiveLearningRate:
             ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
 
         assert ppo.learning_rate == initial_lr
+
+
+def _negate_augmentation(
+    env: object, obs: TensorDict | None, actions: torch.Tensor | None
+) -> tuple[TensorDict | None, torch.Tensor | None]:
+    """Toy mirror: ``[original, negated]`` along the batch dimension."""
+    out_obs = None
+    if obs is not None:
+        out_obs = torch.cat([obs, TensorDict({k: -v for k, v in obs.items()}, batch_size=obs.batch_size)], dim=0)
+    out_actions = None if actions is None else torch.cat([actions, -actions], dim=0)
+    return out_obs, out_actions
+
+
+def _update_with_symmetry(use_mirror_loss: bool) -> tuple[dict[str, float], int]:
+    """Fill the storage through act/process_env_step, run one update; return (losses, compute_loss calls)."""
+    symmetry_cfg = {
+        "env": None,
+        "data_augmentation_func": _negate_augmentation,
+        "use_data_augmentation": True,
+        "use_mirror_loss": use_mirror_loss,
+        "mirror_loss_coeff": 0.5,
+    }
+    ppo, obs = _build_ppo(symmetry_cfg=symmetry_cfg)
+    calls = 0
+    compute_loss = ppo.symmetry.compute_loss
+
+    def counting_compute_loss(*args: object, **kwargs: object) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return compute_loss(*args, **kwargs)
+
+    ppo.symmetry.compute_loss = counting_compute_loss
+    for _ in range(NUM_STEPS):
+        ppo.act(obs)
+        ppo.process_env_step(obs, torch.randn(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+    ppo.compute_returns(obs)
+    return ppo.update(), calls
+
+
+class TestSymmetryLoss:
+    """The mirror loss is only evaluated when it trains the actor."""
+
+    def test_logging_only_symmetry_loss_is_skipped(self) -> None:
+        """use_mirror_loss=False: augmentation still runs, but the extra actor pass (and its metric) is skipped."""
+        losses, calls = _update_with_symmetry(use_mirror_loss=False)
+        assert calls == 0
+        assert "symmetry" not in losses
+
+    def test_mirror_loss_is_computed_and_reported_when_used(self) -> None:
+        losses, calls = _update_with_symmetry(use_mirror_loss=True)
+        assert calls == 2 * 2  # num_learning_epochs * num_mini_batches
+        assert losses["symmetry"] >= 0.0
