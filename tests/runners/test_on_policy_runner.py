@@ -8,9 +8,13 @@
 from __future__ import annotations
 
 import copy
+import os
 import tempfile
 import torch
 from tensordict import TensorDict
+
+import onnx
+import pytest
 
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
@@ -381,3 +385,21 @@ class TestCNNRunner:
 
             for key, param in runner.alg.actor.state_dict().items():
                 assert torch.equal(saved_actor[key], param), f"CNN parameter '{key}' not restored after load"
+
+
+class TestOnnxExport:
+    """Tests for exporting the policy to ONNX."""
+
+    @pytest.mark.parametrize(
+        ("model_type", "rnn_type"), [("mlp", None), ("cnn", None), ("rnn", "gru"), ("rnn", "lstm")]
+    )
+    def test_export_writes_single_file(self, model_type: str, rnn_type: str | None) -> None:
+        """export_policy_to_onnx() should write one self-contained .onnx file, no .onnx.data sidecar."""
+        cfg = _make_train_cfg(model_type)
+        if rnn_type is not None:
+            cfg["actor"]["rnn_type"] = cfg["critic"]["rnn_type"] = rnn_type
+        runner = OnPolicyRunner(DummyEnv(include_image=(model_type == "cnn")), cfg, device="cpu")
+        with tempfile.TemporaryDirectory() as export_dir:
+            runner.export_policy_to_onnx(path=export_dir, filename="policy.onnx")
+            assert os.listdir(export_dir) == ["policy.onnx"]
+            onnx.checker.check_model(onnx.load(os.path.join(export_dir, "policy.onnx")))
