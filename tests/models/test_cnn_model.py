@@ -218,6 +218,8 @@ class TestCNNModelONNXExport:
                 opset_version=18,
                 input_names=onnx_model.input_names,
                 output_names=onnx_model.output_names,
+                dynamo=True,
+                external_data=False,
             )
             loaded = onnx.load(f.name)
             onnx.checker.check_model(loaded)
