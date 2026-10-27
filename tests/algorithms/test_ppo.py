@@ -321,7 +321,7 @@ class TestAdaptiveLearningRate:
 
     def test_lr_restored_on_load(self) -> None:
         """Loading a checkpoint should resume the adapted LR, not restart from the configured one."""
-        adapted_lr = 1e-5  # as left by the adaptive schedule at the end of a run
+        adapted_lr = 1e-5
         ppo, _obs = _build_ppo(schedule="adaptive", learning_rate=1e-3)
         for param_group in ppo.optimizer.param_groups:
             param_group["lr"] = adapted_lr

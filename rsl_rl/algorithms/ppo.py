@@ -430,9 +430,7 @@ class PPO:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
-            # The adaptive schedule steps from ``self.learning_rate``, which the optimizer state doesn't carry.
-            # Without this a resumed run restarts from the configured rate (e.g. 1e-3 instead of a converged
-            # 1e-5), and its first updates can wreck the loaded policy.
+            # Resume the adapted LR, which the optimizer state doesn't carry
             self.learning_rate = self.optimizer.param_groups[0]["lr"]
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
