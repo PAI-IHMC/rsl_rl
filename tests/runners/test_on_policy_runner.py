@@ -8,9 +8,14 @@
 from __future__ import annotations
 
 import copy
+import os
 import tempfile
 import torch
 from tensordict import TensorDict
+
+import onnx
+import onnxruntime
+import pytest
 
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
@@ -381,3 +386,34 @@ class TestCNNRunner:
 
             for key, param in runner.alg.actor.state_dict().items():
                 assert torch.equal(saved_actor[key], param), f"CNN parameter '{key}' not restored after load"
+
+
+class TestOnnxExport:
+    """Tests for exporting the policy to ONNX."""
+
+    @pytest.mark.parametrize(
+        ("model_type", "rnn_type"), [("mlp", None), ("cnn", None), ("rnn", "gru"), ("rnn", "lstm")]
+    )
+    def test_export_writes_single_file_matching_torch(self, model_type: str, rnn_type: str | None) -> None:
+        """export_policy_to_onnx() should write one self-contained .onnx whose outputs match the torch policy."""
+        cfg = _make_train_cfg(model_type)
+        if rnn_type is not None:
+            cfg["actor"]["rnn_type"] = cfg["critic"]["rnn_type"] = rnn_type
+        runner = OnPolicyRunner(DummyEnv(include_image=(model_type == "cnn")), cfg, device="cpu")
+        with tempfile.TemporaryDirectory() as export_dir:
+            runner.export_policy_to_onnx(path=export_dir, filename="policy.onnx")
+            assert os.listdir(export_dir) == ["policy.onnx"]
+            onnx_path = os.path.join(export_dir, "policy.onnx")
+            onnx.checker.check_model(onnx.load(onnx_path))
+            session = onnxruntime.InferenceSession(onnx_path)
+
+        torch_policy = runner.alg.get_policy().as_onnx(verbose=False).eval()
+        inputs = [torch.randn_like(dummy_input) for dummy_input in torch_policy.get_dummy_inputs()]
+        onnx_outputs = session.run(None, {name: x.numpy() for name, x in zip(torch_policy.input_names, inputs)})
+        with torch.no_grad():
+            torch_outputs = torch_policy(*inputs)
+        if isinstance(torch_outputs, torch.Tensor):
+            torch_outputs = (torch_outputs,)
+        assert len(onnx_outputs) == len(torch_outputs)
+        for onnx_output, torch_output in zip(onnx_outputs, torch_outputs):
+            torch.testing.assert_close(torch.from_numpy(onnx_output), torch_output)

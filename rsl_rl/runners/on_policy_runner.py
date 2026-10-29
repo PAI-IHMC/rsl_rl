@@ -204,6 +204,9 @@ class OnPolicyRunner:
             verbose=verbose,
             input_names=onnx_model.input_names,  # type: ignore
             output_names=onnx_model.output_names,  # type: ignore
+            # Pin the exporter across torch versions and keep weights inside the .onnx (no .onnx.data sidecar).
+            dynamo=True,
+            external_data=False,
         )
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
