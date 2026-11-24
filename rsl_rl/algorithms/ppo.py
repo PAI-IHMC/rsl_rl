@@ -15,7 +15,13 @@ from rsl_rl.env import VecEnv
 from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
-from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
+from rsl_rl.utils import (
+    compile_model,
+    reduce_gradients_in_buckets,
+    resolve_class,
+    resolve_obs_groups,
+    resolve_optimizer,
+)
 
 
 class PPO:
@@ -50,6 +56,7 @@ class PPO:
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
         normalize_advantage_per_mini_batch: bool = False,
+        use_mixed_precision: bool = False,
         device: str = "cpu",
         # RND parameters
         rnd_cfg: dict | None = None,
@@ -59,6 +66,7 @@ class PPO:
         aux: object | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        grad_reduce_bucket_mb: float = 25,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -72,6 +80,7 @@ class PPO:
         else:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
+        self.grad_reduce_bucket_mb = grad_reduce_bucket_mb
 
         # RND extension
         self.rnd = RandomNetworkDistillation(device=self.device, **rnd_cfg) if rnd_cfg else None
@@ -92,8 +101,7 @@ class PPO:
         self.actor = actor.to(self.device)
         self.critic = critic.to(self.device)
 
-        # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
-        # simply alias ``self.actor`` / ``self.critic``.
+        # Handles to the uncompiled modules for state_dict operations and export
         self._raw_actor = self.actor
         self._raw_critic = self.critic
 
@@ -124,6 +132,7 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+        self.use_mixed_precision = use_mixed_precision
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
@@ -141,13 +150,7 @@ class PPO:
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
-        """Record one environment step and update the normalizers."""
-        # Update the normalizers
-        self.actor.update_normalization(obs)
-        self.critic.update_normalization(obs)
-        if self.rnd:
-            self.rnd.update_normalization(obs)
-
+        """Record one environment step."""
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
@@ -236,75 +239,79 @@ class PPO:
             if self.symmetry:
                 self.symmetry.augment_batch(batch, original_batch_size)
 
-            # Recompute actions log prob and entropy for current batch of transitions
-            # Note: We need to do this because we updated the policy with new parameters
-            self.actor(
-                batch.observations,
-                masks=batch.masks,
-                hidden_state=batch.hidden_states[0],
-                stochastic_output=True,
-            )
-            actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-            values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
-            # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
-            distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
-            entropy = self.actor.output_entropy[:original_batch_size]
+            # Optionally use mixed precision for the forward pass and loss computation
+            with torch.amp.autocast(  # type: ignore
+                device_type=torch.device(self.device).type, enabled=self.use_mixed_precision, dtype=torch.bfloat16
+            ):
+                # Recompute actions log prob and entropy for current batch of transitions
+                # Note: We need to do this because we updated the policy with new parameters
+                self.actor(
+                    batch.observations,
+                    masks=batch.masks,
+                    hidden_state=batch.hidden_states[0],
+                    stochastic_output=True,
+                )
+                actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
+                values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+                # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
+                distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
+                entropy = self.actor.output_entropy[:original_batch_size]
 
-            # Compute KL divergence and adapt the learning rate
-            if self.desired_kl is not None and self.schedule == "adaptive":
-                with torch.inference_mode():
-                    kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
-                    kl_mean = torch.mean(kl)
+                # Compute KL divergence and adapt the learning rate
+                if self.desired_kl is not None and self.schedule == "adaptive":
+                    with torch.inference_mode():
+                        kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
+                        kl_mean = torch.mean(kl)
 
-                    # Reduce the KL divergence across all GPUs
-                    if self.is_multi_gpu:
-                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                        kl_mean /= self.gpu_world_size
+                        # Reduce the KL divergence across all GPUs
+                        if self.is_multi_gpu:
+                            torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                            kl_mean /= self.gpu_world_size
 
-                    # Update the learning rate only on the main process
-                    if self.gpu_global_rank == 0:
-                        if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                        # Update the learning rate only on the main process
+                        if self.gpu_global_rank == 0:
+                            if kl_mean > self.desired_kl * 2.0:
+                                self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                            elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                                self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
-                    # Update the learning rate for all GPUs
-                    if self.is_multi_gpu:
-                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                        torch.distributed.broadcast(lr_tensor, src=0)
-                        self.learning_rate = lr_tensor.item()
+                        # Update the learning rate for all GPUs
+                        if self.is_multi_gpu:
+                            lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                            torch.distributed.broadcast(lr_tensor, src=0)
+                            self.learning_rate = lr_tensor.item()
 
-                    # Update the learning rate for all parameter groups
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                        # Update the learning rate for all parameter groups
+                        for param_group in self.optimizer.param_groups:
+                            param_group["lr"] = self.learning_rate
 
-            # Surrogate loss
-            ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
-            surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
-            surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-            )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+                # Surrogate loss
+                ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
+                surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
+                surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
+                    ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+                )
+                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # Value function loss
-            if self.use_clipped_value_loss:
-                value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
-                value_losses = (values - batch.returns).pow(2)
-                value_losses_clipped = (value_clipped - batch.returns).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (batch.returns - values).pow(2).mean()
+                # Value function loss
+                if self.use_clipped_value_loss:
+                    value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
+                    value_losses = (values - batch.returns).pow(2)
+                    value_losses_clipped = (value_clipped - batch.returns).pow(2)
+                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                else:
+                    value_loss = (batch.returns - values).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
-            # RND loss
-            rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
+                # RND loss
+                rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
 
-            # Symmetry loss
-            if self.symmetry:
-                symmetry_loss = self.symmetry.compute_loss(self.actor, batch, original_batch_size)
-                if self.symmetry.use_mirror_loss:
-                    loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
+                # Symmetry loss
+                if self.symmetry:
+                    symmetry_loss = self.symmetry.compute_loss(self.actor, batch, original_batch_size)
+                    if self.symmetry.use_mirror_loss:
+                        loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
 
             # Aux joint losses (Persona): summed into the main loss so shared parameters
             # (e.g. an encoder feeding both actor and a reconstruction decoder) receive
@@ -349,6 +356,13 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+
+        # Update the normalizers
+        obs = self.storage.observations.flatten(0, 1)
+        self.actor.update_normalization(obs)  # type: ignore
+        self.critic.update_normalization(obs)  # type: ignore
+        if self.rnd:
+            self.rnd.update_normalization(obs)  # type: ignore
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -430,6 +444,7 @@ class PPO:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            self.learning_rate = self.optimizer.param_groups[0]["lr"]
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
@@ -455,36 +470,36 @@ class PPO:
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPO:
         """Construct the PPO algorithm."""
-        # Resolve class callables
-        alg_class: type[PPO] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
-        actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
-        critic_class: type[MLPModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
+        # Resolve class callables and configs
+        alg_class, alg_cfg = resolve_class(cfg["algorithm"])
+        actor_class, actor_cfg = resolve_class(cfg["actor"])
+        critic_class, critic_cfg = resolve_class(cfg["critic"])
 
         # Resolve observation groups
         default_sets = ["actor", "critic"]
-        if "rnd_cfg" in cfg["algorithm"] and cfg["algorithm"]["rnd_cfg"] is not None:
+        if "rnd_cfg" in alg_cfg and alg_cfg["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
 
         # Resolve RND config if used
-        cfg["algorithm"] = resolve_rnd_config(cfg["algorithm"], obs, cfg["obs_groups"], env)
+        alg_cfg = resolve_rnd_config(alg_cfg, obs, cfg["obs_groups"], env)
 
         # Resolve symmetry config if used
-        cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
+        alg_cfg = resolve_symmetry_config(alg_cfg, env)
 
         # Initialize the policy
-        actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
+        actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **actor_cfg).to(device)
         print(f"Actor Model: {actor}")
-        if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
-            cfg["critic"]["cnns"] = actor.cnns  # type: ignore
-        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
+        if alg_cfg.pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
+            critic_cfg["cnns"] = actor.cnns
+        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_cfg).to(device)
         print(f"Critic Model: {critic}")
 
         # Initialize the storage
         storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
 
         # Initialize the algorithm
-        alg: PPO = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
+        alg: PPO = alg_class(actor, critic, storage, device=device, **alg_cfg, multi_gpu_cfg=cfg["multi_gpu"])
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))
@@ -493,21 +508,14 @@ class PPO:
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""
-        # Obtain the model parameters on current GPU
-        model_params = [self._raw_actor.state_dict(), self._raw_critic.state_dict()]
+        models = [self._raw_actor, self._raw_critic]
         if self.rnd:
-            model_params.append(self.rnd.predictor.state_dict())
+            models += [self.rnd.predictor, self.rnd.target]
         if self.aux is not None:
-            model_params.append(self.aux.state_dict())
-        # Broadcast the model parameters
-        torch.distributed.broadcast_object_list(model_params, src=0)
-        # Load the model parameters on all GPUs from source GPU
-        self._raw_actor.load_state_dict(model_params[0])
-        self._raw_critic.load_state_dict(model_params[1])
-        if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[2])
-        if self.aux is not None:
-            self.aux.load_state_dict(model_params[-1])
+            models.append(self.aux)
+        for model in models:
+            for tensor in model.state_dict().values():
+                torch.distributed.broadcast(tensor, src=0)
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -518,23 +526,10 @@ class PPO:
         # Note: dict.fromkeys dedups parameters shared between models so each gradient is
         # reduced exactly once. Joint-mode aux parameters ride the main backward pass and
         # are reduced here; separate-optimizer aux parameters are reduced by the extension.
-        all_params = chain(self.actor.parameters(), self.critic.parameters())
+        params = chain(self.actor.parameters(), self.critic.parameters())
         if self.rnd:
-            all_params = chain(all_params, self.rnd.parameters())
+            params = chain(params, self.rnd.parameters())
         if self.aux is not None:
-            all_params = chain(all_params, self.aux.joint_parameters())
-        all_params = list(dict.fromkeys(all_params))
-        grads = [param.grad.view(-1) for param in all_params if param.grad is not None]
-        all_grads = torch.cat(grads)
-        # Average the gradients across all GPUs
-        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
-        all_grads /= self.gpu_world_size
-        # Update the gradients for all parameters with the reduced gradients
-        offset = 0
-        for param in all_params:
-            if param.grad is not None:
-                numel = param.numel()
-                # Copy data back from shared buffer
-                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
-                # Update the offset for the next parameter
-                offset += numel
+            params = chain(params, self.aux.joint_parameters())
+        # Average the gradients across all GPUs in bounded buckets
+        reduce_gradients_in_buckets(dict.fromkeys(params), self.gpu_world_size, self.grad_reduce_bucket_mb)
