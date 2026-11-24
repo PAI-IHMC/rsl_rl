@@ -1,0 +1,30 @@
+name: Public Content Check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-content-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      # The term list lives in a secret so it never appears in this public repo or its logs.
+      - name: Scan new commits and PR text for private terms
+        env:
+          DENYLIST: ${{ secrets.PUBLIC_REPO_DENYLIST }}
+        run: python3 .github/scripts/check_public_content.py
