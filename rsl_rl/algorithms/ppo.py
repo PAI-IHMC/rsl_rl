@@ -224,7 +224,7 @@ class PPO:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # Iterate over mini-batches
-        for batch in generator:
+        for mini_batch_idx, batch in enumerate(generator):
             original_batch_size = batch.observations.batch_size[0]
 
             # Check if we should normalize advantages per mini-batch
@@ -301,7 +301,9 @@ class PPO:
             rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
 
             # Symmetry loss
-            if self.symmetry:
+            # Without the mirror loss, only log it on the first mini-batch to keep the extra actor pass cheap.
+            symmetry_loss = None
+            if self.symmetry and (self.symmetry.use_mirror_loss or mini_batch_idx == 0):
                 symmetry_loss = self.symmetry.compute_loss(self.actor, batch, original_batch_size)
                 if self.symmetry.use_mirror_loss:
                     loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
@@ -347,7 +349,7 @@ class PPO:
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
             # Symmetry loss
-            if mean_symmetry_loss is not None:
+            if mean_symmetry_loss is not None and symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
 
         # Divide the losses by the number of updates
@@ -357,8 +359,8 @@ class PPO:
         mean_entropy /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
-        if mean_symmetry_loss is not None:
-            mean_symmetry_loss /= num_updates
+        if mean_symmetry_loss is not None and self.symmetry.use_mirror_loss:
+            mean_symmetry_loss /= num_updates  # otherwise it was only computed on the first mini-batch
 
         # Construct the loss dictionary
         loss_dict = {
