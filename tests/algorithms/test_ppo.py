@@ -10,10 +10,12 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
+import pytest
+
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
-from tests.conftest import make_obs
+from tests.conftest import make_obs, negate_augmentation
 
 NUM_ENVS = 4
 NUM_STEPS = 8
@@ -320,53 +322,43 @@ class TestAdaptiveLearningRate:
         assert ppo.learning_rate == initial_lr
 
 
-def _negate_augmentation(
-    env: object, obs: TensorDict | None, actions: torch.Tensor | None
-) -> tuple[TensorDict | None, torch.Tensor | None]:
-    """Toy mirror: ``[original, negated]`` along the batch dimension."""
-    out_obs = None
-    if obs is not None:
-        out_obs = torch.cat([obs, TensorDict({k: -v for k, v in obs.items()}, batch_size=obs.batch_size)], dim=0)
-    out_actions = None if actions is None else torch.cat([actions, -actions], dim=0)
-    return out_obs, out_actions
-
-
-def _update_with_symmetry(use_mirror_loss: bool) -> tuple[dict[str, float], int]:
-    """Fill the storage through act/process_env_step, run one update; return (losses, compute_loss calls)."""
+def _update_with_symmetry(use_mirror_loss: bool) -> tuple[dict[str, float], list[float]]:
+    """Fill the storage, run one update; return the losses and the value of each ``compute_loss`` call."""
     symmetry_cfg = {
         "env": None,
-        "data_augmentation_func": _negate_augmentation,
+        "data_augmentation_func": negate_augmentation,
         "use_data_augmentation": True,
         "use_mirror_loss": use_mirror_loss,
         "mirror_loss_coeff": 0.5,
     }
     ppo, obs = _build_ppo(symmetry_cfg=symmetry_cfg)
-    calls = 0
+    computed: list[float] = []
     compute_loss = ppo.symmetry.compute_loss
 
-    def counting_compute_loss(*args: object, **kwargs: object) -> torch.Tensor:
-        nonlocal calls
-        calls += 1
-        return compute_loss(*args, **kwargs)
+    def recording_compute_loss(*args: object, **kwargs: object) -> torch.Tensor:
+        loss = compute_loss(*args, **kwargs)
+        computed.append(loss.item())
+        return loss
 
-    ppo.symmetry.compute_loss = counting_compute_loss
+    ppo.symmetry.compute_loss = recording_compute_loss
     for _ in range(NUM_STEPS):
         ppo.act(obs)
         ppo.process_env_step(obs, torch.randn(NUM_ENVS), torch.zeros(NUM_ENVS), {})
     ppo.compute_returns(obs)
-    return ppo.update(), calls
+    return ppo.update(), computed
 
 
 class TestSymmetryLoss:
-    """The mirror loss is only evaluated when it trains the actor."""
+    """The mirror loss is evaluated on every mini-batch when it trains the actor, otherwise once per update."""
 
-    def test_logging_only_symmetry_loss_is_skipped(self) -> None:
-        """use_mirror_loss=False: augmentation still runs, but the extra actor pass (and its metric) is skipped."""
-        losses, calls = _update_with_symmetry(use_mirror_loss=False)
-        assert calls == 0
-        assert "symmetry" not in losses
+    def test_logging_only_symmetry_loss_is_computed_once_per_update(self) -> None:
+        """use_mirror_loss=False: the loss is only evaluated on the first mini-batch, and still reported."""
+        losses, computed = _update_with_symmetry(use_mirror_loss=False)
+        assert len(computed) == 1
+        assert losses["symmetry"] == pytest.approx(computed[0])
 
     def test_mirror_loss_is_computed_and_reported_when_used(self) -> None:
-        losses, calls = _update_with_symmetry(use_mirror_loss=True)
-        assert calls == 2 * 2  # num_learning_epochs * num_mini_batches
-        assert losses["symmetry"] >= 0.0
+        """use_mirror_loss=True: the loss is evaluated on every mini-batch and reported as their mean."""
+        losses, computed = _update_with_symmetry(use_mirror_loss=True)
+        assert len(computed) == 2 * 2  # num_learning_epochs * num_mini_batches
+        assert losses["symmetry"] == pytest.approx(sum(computed) / len(computed))

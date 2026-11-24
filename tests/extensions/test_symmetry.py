@@ -13,32 +13,11 @@ from tensordict import TensorDict
 from rsl_rl.extensions.symmetry import Symmetry
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
-from tests.conftest import make_obs
+from tests.conftest import make_obs, negate_augmentation
 
 NUM_ENVS = 4
 OBS_DIM = 6
 NUM_ACTIONS = 3
-
-
-def _negate_augmentation(
-    env: object,
-    obs: TensorDict | None,
-    actions: torch.Tensor | None,
-) -> tuple[TensorDict | None, torch.Tensor | None]:
-    """Toy data-augmentation callable: concatenate the originals with their element-wise negation.
-
-    Produces a 2x-augmented batch ordered as ``[original, mirrored]`` along the batch dimension.
-    """
-    out_obs = None
-    if obs is not None:
-        neg = TensorDict({k: -v for k, v in obs.items()}, batch_size=obs.batch_size)
-        out_obs = torch.cat([obs, neg], dim=0)
-
-    out_actions = None
-    if actions is not None:
-        out_actions = torch.cat([actions, -actions], dim=0)
-
-    return out_obs, out_actions
 
 
 def _make_batch() -> RolloutStorage.Batch:
@@ -74,7 +53,7 @@ class TestAugmentBatch:
 
     def test_augmentation_doubles_batch(self) -> None:
         """Observations and actions should grow by ``num_aug`` along the batch dimension."""
-        sym = Symmetry(env=None, data_augmentation_func=_negate_augmentation, use_data_augmentation=True)
+        sym = Symmetry(env=None, data_augmentation_func=negate_augmentation, use_data_augmentation=True)
         batch = _make_batch()
 
         sym.augment_batch(batch, NUM_ENVS)
@@ -84,7 +63,7 @@ class TestAugmentBatch:
 
     def test_scalar_tensors_are_repeated(self) -> None:
         """The remainingrollout tensors should be repeated ``num_aug`` times to match the augmented batch."""
-        sym = Symmetry(env=None, data_augmentation_func=_negate_augmentation, use_data_augmentation=True)
+        sym = Symmetry(env=None, data_augmentation_func=negate_augmentation, use_data_augmentation=True)
         batch = _make_batch()
 
         orig_values = batch.values.clone()
@@ -106,7 +85,7 @@ class TestAugmentBatch:
 
     def test_observations_and_actions_are_mirrored(self) -> None:
         """The second half of the augmented batch should contain the mirrored samples, here: negated."""
-        sym = Symmetry(env=None, data_augmentation_func=_negate_augmentation, use_data_augmentation=True)
+        sym = Symmetry(env=None, data_augmentation_func=negate_augmentation, use_data_augmentation=True)
         batch = _make_batch()
 
         orig_policy = batch.observations["policy"].clone()
@@ -121,7 +100,7 @@ class TestAugmentBatch:
 
     def test_noop_when_augmentation_disabled(self) -> None:
         """``augment_batch`` should be a no-op when :attr:`use_data_augmentation` is False."""
-        sym = Symmetry(env=None, data_augmentation_func=_negate_augmentation, use_data_augmentation=False)
+        sym = Symmetry(env=None, data_augmentation_func=negate_augmentation, use_data_augmentation=False)
         batch = _make_batch()
 
         orig_obs_batch_size = batch.observations.batch_size
@@ -140,7 +119,7 @@ class TestComputeLoss:
 
     def test_returns_finite_scalar(self) -> None:
         """The mirror MSE should be a finite, non-negative scalar."""
-        sym = Symmetry(env=None, data_augmentation_func=_negate_augmentation, use_mirror_loss=True)
+        sym = Symmetry(env=None, data_augmentation_func=negate_augmentation, use_mirror_loss=True)
         actor = _make_actor()
         batch = _make_batch()
 
@@ -152,7 +131,7 @@ class TestComputeLoss:
 
     def test_graph_connected_when_mirror_loss_enabled(self) -> None:
         """The returned loss must require gradients when the mirror loss contributes to the policy update."""
-        sym = Symmetry(env=None, data_augmentation_func=_negate_augmentation, use_mirror_loss=True)
+        sym = Symmetry(env=None, data_augmentation_func=negate_augmentation, use_mirror_loss=True)
         actor = _make_actor()
         batch = _make_batch()
 
@@ -160,9 +139,9 @@ class TestComputeLoss:
 
         assert loss.requires_grad
 
-    def test_detached_when_mirror_loss_disabled(self) -> None:
-        """When the mirror loss is off the loss is still returned for logging, but detached from the graph."""
-        sym = Symmetry(env=None, data_augmentation_func=_negate_augmentation, use_mirror_loss=False)
+    def test_no_grad_when_mirror_loss_disabled(self) -> None:
+        """When the mirror loss is off the loss is still returned for logging, but evaluated without gradients."""
+        sym = Symmetry(env=None, data_augmentation_func=negate_augmentation, use_mirror_loss=False)
         actor = _make_actor()
         batch = _make_batch()
 
@@ -174,7 +153,7 @@ class TestComputeLoss:
         """If ``augment_batch`` wasn't called, ``compute_loss`` augments the observations in place."""
         sym = Symmetry(
             env=None,
-            data_augmentation_func=_negate_augmentation,
+            data_augmentation_func=negate_augmentation,
             use_data_augmentation=False,
             use_mirror_loss=True,
         )
@@ -189,7 +168,7 @@ class TestComputeLoss:
         """When data augmentation already happened upstream, ``compute_loss`` must not augment again."""
         sym = Symmetry(
             env=None,
-            data_augmentation_func=_negate_augmentation,
+            data_augmentation_func=negate_augmentation,
             use_data_augmentation=True,
             use_mirror_loss=True,
         )
@@ -208,7 +187,7 @@ class TestComputeLoss:
         The toy augmentation negates observations and actions. An actor whose action mean is an odd function of the
         observation satisfies ``f(-x) == -f(x)``, so the MSE between ``f(-x)`` and ``-f(x)`` should vanish.
         """
-        sym = Symmetry(env=None, data_augmentation_func=_negate_augmentation, use_mirror_loss=True)
+        sym = Symmetry(env=None, data_augmentation_func=negate_augmentation, use_mirror_loss=True)
         batch = _make_batch()
 
         # Replace the actor with a deterministic odd function: f(x) = W x (no bias)

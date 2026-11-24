@@ -212,11 +212,8 @@ class PPO:
         mean_entropy = 0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
-        # Symmetry loss: only computed when it trains the actor. With use_mirror_loss=False it would be
-        # logging only, yet it costs a full extra actor forward pass over the augmented mini-batch
-        # (Persona: ~20% of the update for the perceptive stair networks), so it is skipped then.
-        compute_symmetry_loss = self.symmetry is not None and self.symmetry.use_mirror_loss
-        mean_symmetry_loss = 0 if compute_symmetry_loss else None
+        # Symmetry loss
+        mean_symmetry_loss = 0 if self.symmetry else None
         # Aux losses (Persona): keyed by loss-term name, lazily populated
         mean_aux_losses: dict[str, float] = {}
 
@@ -227,7 +224,7 @@ class PPO:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # Iterate over mini-batches
-        for batch in generator:
+        for mini_batch_idx, batch in enumerate(generator):
             original_batch_size = batch.observations.batch_size[0]
 
             # Check if we should normalize advantages per mini-batch
@@ -304,9 +301,12 @@ class PPO:
             rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
 
             # Symmetry loss
-            if compute_symmetry_loss:
-                symmetry_loss = self.symmetry.compute_loss(self.actor, batch, original_batch_size)  # type: ignore
-                loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss  # type: ignore
+            # Without the mirror loss, only log it on the first mini-batch to keep the extra actor pass cheap.
+            symmetry_loss = None
+            if self.symmetry and (self.symmetry.use_mirror_loss or mini_batch_idx == 0):
+                symmetry_loss = self.symmetry.compute_loss(self.actor, batch, original_batch_size)
+                if self.symmetry.use_mirror_loss:
+                    loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
 
             # Aux joint losses (Persona): summed into the main loss so shared parameters
             # (e.g. an encoder feeding both actor and a reconstruction decoder) receive
@@ -349,7 +349,7 @@ class PPO:
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
             # Symmetry loss
-            if mean_symmetry_loss is not None:
+            if mean_symmetry_loss is not None and symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
 
         # Divide the losses by the number of updates
@@ -359,8 +359,8 @@ class PPO:
         mean_entropy /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
-        if mean_symmetry_loss is not None:
-            mean_symmetry_loss /= num_updates
+        if mean_symmetry_loss is not None and self.symmetry.use_mirror_loss:
+            mean_symmetry_loss /= num_updates  # otherwise it was only computed on the first mini-batch
 
         # Construct the loss dictionary
         loss_dict = {
@@ -370,7 +370,7 @@ class PPO:
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
-        if mean_symmetry_loss is not None:
+        if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
         for aux_name, aux_total in mean_aux_losses.items():
             loss_dict[aux_name] = aux_total / num_updates

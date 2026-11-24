@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import torch
 import torch.nn as nn
 from typing import Callable
@@ -26,7 +27,8 @@ class Symmetry:
     - :attr:`use_mirror_loss` adds an auxiliary MSE term that penalizes the policy for disagreeing with itself when
       evaluated on mirrored observations.
 
-    If both flags are disabled the symmetry loss is still computed for logging purposes but detached from the graph.
+    Without :attr:`use_mirror_loss` the mirror loss is still reported for logging: it is then evaluated without
+    gradients, and :class:`~rsl_rl.algorithms.PPO` only evaluates it on the first mini-batch of each update.
 
     References:
         - Mittal et al. "Symmetry Considerations for Learning Task Symmetric Robot Policies." ICRA (2024).
@@ -63,7 +65,7 @@ class Symmetry:
 
         # Inform the user if symmetry is configured only for logging
         if not (use_data_augmentation or use_mirror_loss):
-            print("Symmetry not used for learning. We will use it for logging instead.")
+            print("Symmetry not used for learning. Only logging the mirror loss, once per update.")
 
     def augment_batch(self, batch: RolloutStorage.Batch, original_batch_size: int) -> None:
         """Augment the mini-batch in place with mirrored observations and actions.
@@ -96,28 +98,30 @@ class Symmetry:
         observations are augmented here first so that the actor is evaluated on both the original and the mirrored
         samples.
 
-        The returned loss is detached when :attr:`use_mirror_loss` is False so that it can be reported for logging
-        without contributing to gradients.
+        When :attr:`use_mirror_loss` is False the loss is evaluated under :func:`torch.no_grad`, so it can be reported
+        for logging without building a graph or contributing to gradients.
         """
         # Augment observations if the batch has not already been augmented
         if not self.use_data_augmentation:
             batch.observations, _ = self.data_augmentation_func(env=self.env, obs=batch.observations, actions=None)
 
-        # Action means predicted by the actor on the augmented observation batch
-        mean_actions = actor(batch.observations.detach().clone())
+        with contextlib.nullcontext() if self.use_mirror_loss else torch.no_grad():
+            # Action means predicted by the actor on the augmented observation batch
+            mean_actions = actor(batch.observations.detach().clone())
 
-        # Mirror the original-slice action means using the augmentation function. We use the action means here rather
-        # than the sampled actions in ``batch.actions``, since the symmetry loss is defined on the policy mean.
-        _, mean_actions_symm = self.data_augmentation_func(
-            env=self.env, obs=None, actions=mean_actions[:original_batch_size]
-        )
+            # Mirror the original-slice action means using the augmentation function. We use the action means here
+            # rather than the sampled actions in ``batch.actions``, since the symmetry loss is defined on the policy
+            # mean.
+            _, mean_actions_symm = self.data_augmentation_func(
+                env=self.env, obs=None, actions=mean_actions[:original_batch_size]
+            )
 
-        # MSE between the actor prediction on mirrored obs and the mirrored actor prediction on the original obs
-        symmetry_loss = nn.functional.mse_loss(
-            mean_actions[original_batch_size:],
-            mean_actions_symm.detach()[original_batch_size:],
-        )
-        return symmetry_loss if self.use_mirror_loss else symmetry_loss.detach()
+            # MSE between the actor prediction on mirrored obs and the mirrored actor prediction on the original obs
+            symmetry_loss = nn.functional.mse_loss(
+                mean_actions[original_batch_size:],
+                mean_actions_symm.detach()[original_batch_size:],
+            )
+        return symmetry_loss
 
 
 def resolve_symmetry_config(alg_cfg: dict, env: VecEnv) -> dict:
